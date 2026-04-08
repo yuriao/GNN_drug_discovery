@@ -1,0 +1,8 @@
+{
+  "model": "gin",
+  "best_epoch": 8,
+  "best_val_roc_auc": 0.7762,
+  "test_roc_auc_at_best_val": 0.7689,
+  "device": "cpu",
+  "epochs_ran": 12
+}
