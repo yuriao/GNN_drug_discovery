@@ -1,0 +1,109 @@
+name: Train GNN Model
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'configs/**'
+      - 'requirements.txt'
+      - '.github/workflows/train.yml'
+  workflow_dispatch:
+    inputs:
+      model:
+        description: 'Model type (gcn or gin)'
+        required: false
+        default: 'gin'
+      epochs:
+        description: 'Number of training epochs'
+        required: false
+        default: '15'
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install PyTorch (CPU)
+        run: |
+          pip install torch==2.2.2 --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install torch-geometric + dependencies
+        run: |
+          pip install torch-geometric==2.5.3
+          pip install ogb>=1.3.6 rdkit>=2023.9.5 scikit-learn pandas numpy pyyaml tqdm
+
+      - name: Train model
+        run: |
+          MODEL="${{ github.event.inputs.model || 'gin' }}"
+          EPOCHS="${{ github.event.inputs.epochs || '15' }}"
+          python -m src.train \
+            --model $MODEL \
+            --epochs $EPOCHS \
+            --batch-size 64 \
+            --hidden-dim 128 \
+            --num-layers 4 \
+            --dropout 0.2 \
+            --lr 1e-3 \
+            --patience 5 \
+            --outdir outputs/run_${MODEL}
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+
+      - name: Save dataset stats
+        run: |
+          python -c "
+          from src.data.load_ogb import build_dataloaders, save_dataset_stats
+          dataset, split_idx, *_ = build_dataloaders()
+          save_dataset_stats(dataset, split_idx, 'outputs/run_${{ github.event.inputs.model || \"gin\" }}')
+          print('Dataset stats saved')
+          "
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+
+      - name: Run preprocessing summary
+        run: |
+          python -m src.run_pipeline --outdir outputs/run_${{ github.event.inputs.model || 'gin' }}
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+
+      - name: Show results
+        run: |
+          echo "=== Run Summary ==="
+          cat outputs/run_${{ github.event.inputs.model || 'gin' }}/run_summary.json || true
+          echo "=== Metrics (last 5 epochs) ==="
+          python -c "import pandas as pd; df=pd.read_csv('outputs/run_${{ github.event.inputs.model || \"gin\" }}/metrics.csv'); print(df.tail(5).to_string())" || true
+
+      - name: Create release artifacts archive
+        run: |
+          MODEL="${{ github.event.inputs.model || 'gin' }}"
+          zip -r gnn_artifacts.zip outputs/run_${MODEL}/
+
+      - name: Upload artifacts to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: model-latest
+          name: Latest Trained Model
+          body: |
+            Auto-generated from training run on ${{ github.sha }}
+            Model: ${{ github.event.inputs.model || 'gin' }}
+            Epochs: ${{ github.event.inputs.epochs || '15' }}
+          files: |
+            gnn_artifacts.zip
+            outputs/run_${{ github.event.inputs.model || 'gin' }}/best_model.pt
+            outputs/run_${{ github.event.inputs.model || 'gin' }}/metrics.csv
+            outputs/run_${{ github.event.inputs.model || 'gin' }}/run_summary.json
+            outputs/run_${{ github.event.inputs.model || 'gin' }}/dataset_stats.json
+            outputs/run_${{ github.event.inputs.model || 'gin' }}/preprocessing_summary.json
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
