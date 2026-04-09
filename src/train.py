@@ -81,6 +81,8 @@ def parse_args():
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--pos-weight", type=float, default=0.0,
                         help="BCE pos_weight (0 = auto-compute from class balance)")
+    parser.add_argument("--augment-positives", type=int, default=0,
+                        help="SMILES augmentation: generate N random SMILES per positive training molecule (0=off)")
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--outdir", type=str, default="outputs/run")
@@ -90,11 +92,16 @@ def parse_args():
 def main():
     args = parse_args()
     set_seed(args.seed)
+    if args.augment_positives > 0:
+        print(f"SMILES augmentation: {args.augment_positives} variants per positive training molecule")
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    dataset, split_idx, train_loader, valid_loader, test_loader = build_dataloaders(batch_size=args.batch_size)
+    dataset, split_idx, train_loader, valid_loader, test_loader = build_dataloaders(
+        batch_size=args.batch_size,
+        augment_positives=args.augment_positives,
+    )
     save_dataset_stats(dataset, split_idx, args.outdir)
 
     model = build_model(args.model, dataset[0].x.shape[1], args.hidden_dim, args.num_layers, args.dropout)
