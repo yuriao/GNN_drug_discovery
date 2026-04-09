@@ -132,6 +132,7 @@ def main():
             torch.save(
                 {
                     "model_state": model.state_dict(),
+                    "model_type": args.model,
                     "args": vars(args),
                     "num_node_features": int(dataset[0].x.shape[1]),
                 },
