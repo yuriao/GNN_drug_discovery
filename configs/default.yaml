@@ -1,0 +1,11 @@
+seed: 42
+dataset_name: ogbg-molhiv
+model: gin
+hidden_dim: 128
+num_layers: 4
+dropout: 0.2
+batch_size: 64
+epochs: 30
+lr: 0.001
+weight_decay: 0.00001
+patience: 10
