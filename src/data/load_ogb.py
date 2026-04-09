@@ -114,11 +114,13 @@ def _augment_positive_smiles(
 
                 # Convert to graph
                 graph = smiles2graph(rand_smi)
+                node_feat = torch.from_numpy(graph["node_feat"]).to(torch.long)
                 aug_data = Data(
-                    x=torch.from_numpy(graph["node_feat"]).to(torch.long),
+                    x=node_feat,
                     edge_index=torch.from_numpy(graph["edge_index"]).to(torch.long),
                     edge_attr=torch.from_numpy(graph["edge_feat"]).to(torch.long),
                     y=data.y.clone(),
+                    num_nodes=node_feat.size(0),
                 )
                 augmented.append(aug_data)
                 added += 1
