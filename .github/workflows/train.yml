@@ -42,7 +42,7 @@ jobs:
       - name: Install remaining dependencies
         run: |
           pip install torch-geometric==2.5.3
-          pip install ogb rdkit scikit-learn pandas numpy pyyaml tqdm
+          pip install "numpy<2" ogb rdkit scikit-learn pandas pyyaml tqdm
 
       - name: Set model + epochs
         id: params
