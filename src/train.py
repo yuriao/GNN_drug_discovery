@@ -79,6 +79,8 @@ def parse_args():
     parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
+    parser.add_argument("--pos-weight", type=float, default=0.0,
+                        help="BCE pos_weight (0 = auto-compute from class balance)")
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--outdir", type=str, default="outputs/run")
@@ -101,7 +103,18 @@ def main():
     model = model.to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    criterion = nn.BCEWithLogitsLoss()
+    # Compute class weight to handle imbalance (~1.5% positive in molhiv)
+    if args.pos_weight > 0:
+        pw = torch.tensor([args.pos_weight])
+    else:
+        # Auto: count positives/negatives in train set
+        all_labels = torch.cat([data.y.view(-1) for data in train_loader.dataset])
+        mask = ~torch.isnan(all_labels)
+        n_pos = float(all_labels[mask].sum())
+        n_neg = float(mask.sum()) - n_pos
+        pw = torch.tensor([n_neg / max(n_pos, 1)])
+        print(f"Auto pos_weight: {pw.item():.1f} ({int(n_pos)} pos / {int(n_neg)} neg)")
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pw.to(device))
 
     best_val = -1.0
     best_epoch = -1
