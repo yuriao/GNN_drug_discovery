@@ -64,7 +64,7 @@ jobs:
             --lr 1e-3 \
             --patience 8 \
             --pos-weight 0 \
-            --augment-positives 10
+            --augment-positives 10 \
             --outdir outputs/run_${{ steps.params.outputs.model }}
 
       - name: Save dataset stats + preprocessing summary
