@@ -48,7 +48,7 @@ jobs:
         id: params
         run: |
           echo "model=${{ github.event.inputs.model || 'gin' }}" >> $GITHUB_OUTPUT
-          echo "epochs=${{ github.event.inputs.epochs || '15' }}" >> $GITHUB_OUTPUT
+          echo "epochs=${{ github.event.inputs.epochs || '30' }}" >> $GITHUB_OUTPUT
 
       - name: Train model
         env:
@@ -62,7 +62,8 @@ jobs:
             --num-layers 4 \
             --dropout 0.2 \
             --lr 1e-3 \
-            --patience 5 \
+            --patience 8 \
+            --pos-weight 0 \
             --outdir outputs/run_${{ steps.params.outputs.model }}
 
       - name: Save dataset stats + preprocessing summary
