@@ -23,11 +23,15 @@ class GCNClassifier(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, x, edge_index, batch):
+    def forward(self, x, edge_index, batch, return_node_embeddings: bool = False):
         x = x.float()
         for conv in self.convs:
             x = conv(x, edge_index)
             x = F.relu(x)
             x = F.dropout(x, p=self.dropout, training=self.training)
+        node_embeddings = x
         x = global_mean_pool(x, batch)
-        return self.head(x).view(-1)
+        out = self.head(x).view(-1)
+        if return_node_embeddings:
+            return out, node_embeddings
+        return out
