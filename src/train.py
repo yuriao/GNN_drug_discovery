@@ -16,7 +16,7 @@ from src.utils.metrics import safe_pr_auc, safe_roc_auc
 from src.utils.seed import set_seed
 
 
-def run_epoch(model, loader, optimizer, criterion, device):
+def run_epoch(model, loader, optimizer, criterion, device, model_name: str = "gin"):
     model.train()
     total_loss = 0.0
     total_count = 0
@@ -29,7 +29,14 @@ def run_epoch(model, loader, optimizer, criterion, device):
             continue
 
         optimizer.zero_grad()
-        logits = model(batch.x, batch.edge_index, batch.batch)
+
+        # GINE requires edge_attr; GIN/GCN ignore it
+        if model_name == "gine":
+            logits = model(batch.x, batch.edge_index, batch.batch,
+                           edge_attr=batch.edge_attr)
+        else:
+            logits = model(batch.x, batch.edge_index, batch.batch)
+
         loss = criterion(logits[mask], y[mask])
         loss.backward()
         optimizer.step()
@@ -41,10 +48,9 @@ def run_epoch(model, loader, optimizer, criterion, device):
 
 
 @torch.no_grad()
-def evaluate(model, loader, device):
+def evaluate(model, loader, device, model_name: str = "gin"):
     model.eval()
-    y_true = []
-    y_score = []
+    y_true, y_score = [], []
 
     for batch in loader:
         batch = batch.to(device)
@@ -52,26 +58,31 @@ def evaluate(model, loader, device):
         mask = ~torch.isnan(y)
         if mask.sum() == 0:
             continue
-        logits = model(batch.x, batch.edge_index, batch.batch)
-        probs = torch.sigmoid(logits)
 
+        if model_name == "gine":
+            logits = model(batch.x, batch.edge_index, batch.batch,
+                           edge_attr=batch.edge_attr)
+        else:
+            logits = model(batch.x, batch.edge_index, batch.batch)
+
+        probs = torch.sigmoid(logits)
         y_true.append(y[mask].detach().cpu().numpy())
         y_score.append(probs[mask].detach().cpu().numpy())
 
     if not y_true:
         return {"roc_auc": float("nan"), "pr_auc": float("nan")}
 
-    y_true_np = np.concatenate(y_true)
-    y_score_np = np.concatenate(y_score)
+    yt = np.concatenate(y_true)
+    ys = np.concatenate(y_score)
     return {
-        "roc_auc": safe_roc_auc(y_true_np, y_score_np),
-        "pr_auc": safe_pr_auc(y_true_np, y_score_np),
+        "roc_auc": safe_roc_auc(yt, ys),
+        "pr_auc":  safe_pr_auc(yt, ys),
     }
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train GNN on ogbg-molhiv")
-    parser.add_argument("--model", choices=["gcn", "gin"], default="gin")
+    parser.add_argument("--model", choices=["gcn", "gin", "gine"], default="gin")
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--hidden-dim", type=int, default=128)
@@ -81,8 +92,7 @@ def parse_args():
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--pos-weight", type=float, default=0.0,
                         help="BCE pos_weight (0 = auto-compute from class balance)")
-    parser.add_argument("--augment-positives", type=int, default=0,
-                        help="SMILES augmentation: generate N random SMILES per positive training molecule (0=off)")
+    parser.add_argument("--augment-positives", type=int, default=0)
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--outdir", type=str, default="outputs/run")
@@ -92,8 +102,6 @@ def parse_args():
 def main():
     args = parse_args()
     set_seed(args.seed)
-    if args.augment_positives > 0:
-        print(f"SMILES augmentation: {args.augment_positives} variants per positive training molecule")
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -104,23 +112,31 @@ def main():
     )
     save_dataset_stats(dataset, split_idx, args.outdir)
 
-    model = build_model(args.model, dataset[0].x.shape[1], args.hidden_dim, args.num_layers, args.dropout)
+    num_edge_feat = dataset[0].edge_attr.shape[1] if dataset[0].edge_attr is not None else 3
+    model = build_model(
+        args.model,
+        dataset[0].x.shape[1],
+        args.hidden_dim,
+        args.num_layers,
+        args.dropout,
+        num_edge_features=num_edge_feat,
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    # Compute class weight to handle imbalance (~1.5% positive in molhiv)
+
     if args.pos_weight > 0:
         pw = torch.tensor([args.pos_weight])
     else:
-        # Auto: count positives/negatives in train set
         all_labels = torch.cat([data.y.view(-1) for data in train_loader.dataset])
         mask = ~torch.isnan(all_labels)
         n_pos = float(all_labels[mask].sum())
         n_neg = float(mask.sum()) - n_pos
         pw = torch.tensor([n_neg / max(n_pos, 1)])
         print(f"Auto pos_weight: {pw.item():.1f} ({int(n_pos)} pos / {int(n_neg)} neg)")
+
     criterion = nn.BCEWithLogitsLoss(pos_weight=pw.to(device))
 
     best_val = -1.0
@@ -129,18 +145,18 @@ def main():
     wait = 0
     history = []
 
-    for epoch in tqdm(range(1, args.epochs + 1), desc="Training"):
-        train_loss = run_epoch(model, train_loader, optimizer, criterion, device)
-        val_metrics = evaluate(model, valid_loader, device)
-        test_metrics = evaluate(model, test_loader, device)
+    for epoch in tqdm(range(1, args.epochs + 1), desc=f"Training {args.model.upper()}"):
+        train_loss = run_epoch(model, train_loader, optimizer, criterion, device, args.model)
+        val_metrics  = evaluate(model, valid_loader, device, args.model)
+        test_metrics = evaluate(model, test_loader,  device, args.model)
 
         row = {
             "epoch": epoch,
             "train_loss": train_loss,
-            "val_roc_auc": val_metrics["roc_auc"],
-            "val_pr_auc": val_metrics["pr_auc"],
+            "val_roc_auc":  val_metrics["roc_auc"],
+            "val_pr_auc":   val_metrics["pr_auc"],
             "test_roc_auc": test_metrics["roc_auc"],
-            "test_pr_auc": test_metrics["pr_auc"],
+            "test_pr_auc":  test_metrics["pr_auc"],
         }
         history.append(row)
 
@@ -155,6 +171,7 @@ def main():
                     "model_type": args.model,
                     "args": vars(args),
                     "num_node_features": int(dataset[0].x.shape[1]),
+                    "num_edge_features": int(num_edge_feat),
                 },
                 outdir / "best_model.pt",
             )
@@ -164,8 +181,7 @@ def main():
         if wait >= args.patience:
             break
 
-    metrics_df = pd.DataFrame(history)
-    metrics_df.to_csv(outdir / "metrics.csv", index=False)
+    pd.DataFrame(history).to_csv(outdir / "metrics.csv", index=False)
 
     summary = {
         "model": args.model,
@@ -176,7 +192,6 @@ def main():
         "epochs_ran": int(len(history)),
     }
     (outdir / "run_summary.json").write_text(json.dumps(summary, indent=2))
-
     print(json.dumps(summary, indent=2))
 
 
