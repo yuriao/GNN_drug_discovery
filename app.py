@@ -18,35 +18,52 @@ import torch
 # ── Config ────────────────────────────────────────────────────────────────────
 GITHUB_REPO = "yuriao/GNN_drug_discovery"
 RELEASE_TAG = "model-latest"
-ARTIFACTS_DIR = Path("outputs/run_gin")
-ARTIFACTS = [
-    "best_model.pt",
-    "metrics.csv",
-    "run_summary.json",
-    "dataset_stats.json",
-    "preprocessing_summary.json",
+ARTIFACTS_DIR = Path("outputs/run_gin")   # primary — used for stats/metrics
+ENSEMBLE_DIRS = {
+    "gin":  Path("outputs/run_gin"),
+    "gcn":  Path("outputs/run_gcn"),
+    "gine": Path("outputs/run_gine"),
+}
+# (local_path, release_asset_name)
+ENSEMBLE_ASSETS = {
+    "gin":  ("outputs/run_gin/best_model.pt",  "gin_best_model.pt"),
+    "gcn":  ("outputs/run_gcn/best_model.pt",  "gcn_best_model.pt"),
+    "gine": ("outputs/run_gine/best_model.pt", "gine_best_model.pt"),
+}
+SHARED_ASSETS = [
+    ("outputs/run_gin/metrics.csv",                "gin_metrics.csv"),
+    ("outputs/run_gin/run_summary.json",           "gin_run_summary.json"),
+    ("outputs/run_gin/dataset_stats.json",         "dataset_stats.json"),
+    ("outputs/run_gin/preprocessing_summary.json", "preprocessing_summary.json"),
+    ("outputs/ensemble_summary.json",              "ensemble_summary.json"),
 ]
 
 # ── Artifact download ─────────────────────────────────────────────────────────
 
 def download_artifacts():
-    """Download model artifacts from the latest GitHub release if not present."""
-    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    """Download ensemble model artifacts from the latest GitHub release."""
+    for d in ENSEMBLE_DIRS.values():
+        d.mkdir(parents=True, exist_ok=True)
+    Path("outputs").mkdir(parents=True, exist_ok=True)
     base_url = f"https://github.com/{GITHUB_REPO}/releases/download/{RELEASE_TAG}"
-    missing = [f for f in ARTIFACTS if not (ARTIFACTS_DIR / f).exists()]
-    if not missing:
+    to_fetch = []
+    for local_path, asset_name in list(ENSEMBLE_ASSETS.values()) + SHARED_ASSETS:
+        dest = Path(local_path)
+        if not dest.exists():
+            to_fetch.append((asset_name, dest))
+    if not to_fetch:
         return True
-    progress = st.progress(0, text="Downloading model artifacts...")
-    for i, fname in enumerate(missing):
-        url = f"{base_url}/{fname}"
-        dest = ARTIFACTS_DIR / fname
+    progress = st.progress(0, text="Downloading ensemble artifacts...")
+    for i, (asset_name, dest) in enumerate(to_fetch):
+        url = f"{base_url}/{asset_name}"
         try:
             urllib.request.urlretrieve(url, dest)
-            progress.progress((i + 1) / len(missing), text=f"Downloaded {fname}")
+            progress.progress((i + 1) / len(to_fetch), text=f"Downloaded {asset_name}")
         except Exception as e:
-            st.warning(f"Could not download {fname}: {e}")
+            st.warning(f"Could not download {asset_name}: {e}")
     progress.empty()
-    return all((ARTIFACTS_DIR / f).exists() for f in ["run_summary.json", "metrics.csv"])
+    return (Path("outputs/run_gin/best_model.pt").exists() and
+            Path("outputs/run_gin/run_summary.json").exists())
 
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -186,56 +203,102 @@ with tab4:
                                placeholder="e.g. CC(=O)OC1=CC=CC=C1C(=O)O")
 
     if st.button("🧬 Predict", type="primary") and smiles:
-        model_path = ARTIFACTS_DIR / "best_model.pt"
-        if not model_path.exists():
-            st.error("Model checkpoint not found.")
-        else:
-            try:
-                from rdkit import Chem
-                mol = Chem.MolFromSmiles(smiles)
-                if mol is None:
-                    st.error("Invalid SMILES string. Please check your input.")
-                else:
-                    import sys
-                    sys.path.insert(0, str(Path(__file__).parent))
-                    from src.data.smiles_to_graph import smiles_to_pyg
-                    from src.models.factory import build_model
-                    from torch_geometric.data import Batch
+        try:
+            from rdkit import Chem
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
+                st.error("Invalid SMILES string. Please check your input.")
+            else:
+                import sys
+                sys.path.insert(0, str(Path(__file__).parent))
+                from src.data.smiles_to_graph import smiles_to_pyg
+                from src.models.ensemble import load_ensemble
+                from src.models.factory import build_model
+                from torch_geometric.data import Batch
 
-                    ckpt = torch.load(model_path, map_location="cpu")
-                    model = build_model(
-                        ckpt.get("model_type", "gin"),
+                device = torch.device("cpu")
+                graph = smiles_to_pyg(smiles)
+                batch = Batch.from_data_list([graph]).to(device)
+
+                available_ckpts = {
+                    name: str(Path(local))
+                    for name, (local, _) in ENSEMBLE_ASSETS.items()
+                    if Path(local).exists()
+                }
+
+                member_probs = {}
+                if len(available_ckpts) >= 2:
+                    ensemble = load_ensemble(available_ckpts, device)
+                    with torch.no_grad():
+                        prob = ensemble(batch.x, batch.edge_index, batch.batch,
+                                        edge_attr=batch.edge_attr).item()
+                    for mname, ckpt_path in available_ckpts.items():
+                        ckpt = torch.load(ckpt_path, map_location="cpu")
+                        m = build_model(
+                            mname,
+                            ckpt.get("num_node_features", 9),
+                            ckpt.get("args", {}).get("hidden_dim", 128),
+                            ckpt.get("args", {}).get("num_layers", 4),
+                            ckpt.get("args", {}).get("dropout", 0.2),
+                            num_edge_features=ckpt.get("num_edge_features", 3),
+                        )
+                        m.load_state_dict(ckpt["model_state"])
+                        m.eval()
+                        with torch.no_grad():
+                            if mname == "gine":
+                                lg = m(batch.x, batch.edge_index, batch.batch, edge_attr=batch.edge_attr)
+                            else:
+                                lg = m(batch.x, batch.edge_index, batch.batch)
+                            member_probs[mname.upper()] = torch.sigmoid(lg).item()
+                    label = "Ensemble (GIN + GCN + GINE)"
+                else:
+                    ckpt_path = list(available_ckpts.values())[0]
+                    mname = list(available_ckpts.keys())[0]
+                    ckpt = torch.load(ckpt_path, map_location="cpu")
+                    m = build_model(
+                        mname,
                         ckpt.get("num_node_features", 9),
                         ckpt.get("args", {}).get("hidden_dim", 128),
                         ckpt.get("args", {}).get("num_layers", 4),
                         ckpt.get("args", {}).get("dropout", 0.2),
+                        num_edge_features=ckpt.get("num_edge_features", 3),
                     )
-                    model.load_state_dict(ckpt["model_state"])
-                    model.eval()
-
-                    graph = smiles_to_pyg(smiles)
-                    batch = Batch.from_data_list([graph])
+                    m.load_state_dict(ckpt["model_state"])
+                    m.eval()
                     with torch.no_grad():
-                        logit = model(batch.x, batch.edge_index, batch.batch)
-                        prob = torch.sigmoid(logit).item()
+                        if mname == "gine":
+                            lg = m(batch.x, batch.edge_index, batch.batch, edge_attr=batch.edge_attr)
+                        else:
+                            lg = m(batch.x, batch.edge_index, batch.batch)
+                        prob = torch.sigmoid(lg).item()
+                    member_probs[mname.upper()] = prob
+                    label = f"{mname.upper()} (single model)"
 
-                    st.metric("HIV Inhibition Probability", f"{prob:.4f}")
+                c1, c2 = st.columns([1, 1])
+                with c1:
+                    st.metric(f"HIV Inhibition Probability ({label})", f"{prob:.4f}")
                     if prob > 0.5:
-                        st.success(f"⚠️ HIGH probability of HIV inhibition ({prob:.1%})")
+                        st.error(f"HIGH probability of HIV inhibition ({prob:.1%})")
+                    elif prob > 0.3:
+                        st.warning(f"MODERATE probability ({prob:.1%})")
                     else:
-                        st.info(f"✅ LOW probability of HIV inhibition ({prob:.1%})")
-
-                    # Show molecule structure
+                        st.success(f"LOW probability of HIV inhibition ({prob:.1%})")
+                    if member_probs:
+                        st.markdown("**Individual model scores:**")
+                        for mn, mp in member_probs.items():
+                            bar = chr(9608) * int(mp * 20)
+                            st.caption(f"{mn}: {mp:.3f}  {bar}")
+                with c2:
                     from rdkit.Chem import Draw
                     from rdkit.Chem.Draw import rdMolDraw2D
                     import io
-                    drawer = rdMolDraw2D.MolDraw2DSVG(400, 300)
+                    drawer = rdMolDraw2D.MolDraw2DSVG(380, 280)
                     drawer.DrawMolecule(mol)
                     drawer.FinishDrawing()
-                    st.image(io.BytesIO(drawer.GetDrawingText().encode()), width=400)
+                    st.image(io.BytesIO(drawer.GetDrawingText().encode()), width=380)
 
-            except Exception as e:
-                st.error(f"Prediction failed: {e}")
+        except Exception as e:
+            st.error(f"Prediction failed: {e}")
 
 st.divider()
 st.caption("Model trained on ogbg-molhiv (scaffold split) · Metric: ROC-AUC · "
