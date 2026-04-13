@@ -181,20 +181,35 @@ jobs:
           gh release delete $TAG --yes 2>/dev/null || true
           git push origin --delete $TAG 2>/dev/null || true
 
+          # gh release create requires unique filenames — copy to dist/ with unique names
+          mkdir -p dist
+          cp outputs/run_gin/best_model.pt  dist/gin_best_model.pt
+          cp outputs/run_gcn/best_model.pt  dist/gcn_best_model.pt
+          cp outputs/run_gine/best_model.pt dist/gine_best_model.pt
+          cp outputs/run_gin/metrics.csv    dist/gin_metrics.csv
+          cp outputs/run_gcn/metrics.csv    dist/gcn_metrics.csv
+          cp outputs/run_gine/metrics.csv   dist/gine_metrics.csv
+          cp outputs/run_gin/run_summary.json   dist/gin_run_summary.json
+          cp outputs/run_gcn/run_summary.json   dist/gcn_run_summary.json
+          cp outputs/run_gine/run_summary.json  dist/gine_run_summary.json
+          cp outputs/run_gin/dataset_stats.json         dist/dataset_stats.json
+          cp outputs/run_gin/preprocessing_summary.json dist/preprocessing_summary.json
+          cp outputs/ensemble_summary.json              dist/ensemble_summary.json
+
           gh release create $TAG \
             --title "Latest Ensemble Model ($(date -u +%Y-%m-%d))" \
             --notes "Ensemble: GIN + GCN + GINE | Epochs: ${{ steps.params.outputs.epochs }} | SHA: ${{ github.sha }}" \
-            outputs/run_gin/best_model.pt#gin_best_model.pt \
-            outputs/run_gcn/best_model.pt#gcn_best_model.pt \
-            outputs/run_gine/best_model.pt#gine_best_model.pt \
-            outputs/run_gin/metrics.csv#gin_metrics.csv \
-            outputs/run_gcn/metrics.csv#gcn_metrics.csv \
-            outputs/run_gine/metrics.csv#gine_metrics.csv \
-            outputs/run_gin/run_summary.json#gin_run_summary.json \
-            outputs/run_gcn/run_summary.json#gcn_run_summary.json \
-            outputs/run_gine/run_summary.json#gine_run_summary.json \
-            outputs/run_gin/dataset_stats.json \
-            outputs/run_gin/preprocessing_summary.json \
-            outputs/ensemble_summary.json
+            dist/gin_best_model.pt \
+            dist/gcn_best_model.pt \
+            dist/gine_best_model.pt \
+            dist/gin_metrics.csv \
+            dist/gcn_metrics.csv \
+            dist/gine_metrics.csv \
+            dist/gin_run_summary.json \
+            dist/gcn_run_summary.json \
+            dist/gine_run_summary.json \
+            dist/dataset_stats.json \
+            dist/preprocessing_summary.json \
+            dist/ensemble_summary.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
