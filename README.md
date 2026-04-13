@@ -1,7 +1,7 @@
 # GNN Drug Discovery — HIV Inhibition Prediction
 
 [![Train GNN Model](https://github.com/yuribo/GNN_drug_discovery/actions/workflows/train.yml/badge.svg)](https://github.com/yuribo/GNN_drug_discovery/actions/workflows/train.yml)
-[![Live Dashboard](https://img.shields.io/badge/🧬_Dashboard-HuggingFace_Spaces-yellow)](https://huggingface.co/spaces/yuriao/gnn-drug-discovery)
+[![Live Dashboard](https://img.shields.io/badge/🧬_Dashboard-HuggingFace_Spaces-yellow)](https://huggingface.co/spaces/yuribo/gnn-drug-discovery)
 
 An end-to-end Graph Neural Network (GNN) pipeline for molecular biology. Predicts whether a molecule inhibits HIV replication using the **ogbg-molhiv** benchmark (41,127 molecules, scaffold split, ROC-AUC metric).
 
