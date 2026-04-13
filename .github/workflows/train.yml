@@ -1,4 +1,4 @@
-name: Train GNN Model
+name: Train GNN Ensemble (GIN + GCN + GINE)
 
 on:
   push:
@@ -10,14 +10,10 @@ on:
       - '.github/workflows/train.yml'
   workflow_dispatch:
     inputs:
-      model:
-        description: 'Model type (gcn or gin)'
-        required: false
-        default: 'gin'
       epochs:
-        description: 'Number of training epochs'
+        description: 'Epochs per model'
         required: false
-        default: '15'
+        default: '30'
 
 permissions:
   contents: write
@@ -25,7 +21,7 @@ permissions:
 jobs:
   train:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
 
     steps:
       - uses: actions/checkout@v4
@@ -44,79 +40,161 @@ jobs:
           pip install torch-geometric==2.5.3
           pip install "numpy<2" ogb rdkit scikit-learn pandas pyyaml tqdm
 
-      - name: Set model + epochs
+      - name: Set epochs
         id: params
-        run: |
-          echo "model=${{ github.event.inputs.model || 'gin' }}" >> $GITHUB_OUTPUT
-          echo "epochs=${{ github.event.inputs.epochs || '30' }}" >> $GITHUB_OUTPUT
+        run: echo "epochs=${{ github.event.inputs.epochs || '30' }}" >> $GITHUB_OUTPUT
 
-      - name: Train model
+      # ── Train GIN ──────────────────────────────────────────────────────────
+      - name: Train GIN
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           python -m src.train \
-            --model ${{ steps.params.outputs.model }} \
+            --model gin \
             --epochs ${{ steps.params.outputs.epochs }} \
             --batch-size 64 \
             --hidden-dim 128 \
             --num-layers 4 \
             --dropout 0.2 \
             --lr 1e-3 \
-            --patience 8 \
+            --patience 10 \
             --pos-weight 0 \
             --augment-positives 10 \
-            --outdir outputs/run_${{ steps.params.outputs.model }}
+            --outdir outputs/run_gin
 
-      - name: Save dataset stats + preprocessing summary
+      # ── Train GCN ──────────────────────────────────────────────────────────
+      - name: Train GCN
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python -m src.train \
+            --model gcn \
+            --epochs ${{ steps.params.outputs.epochs }} \
+            --batch-size 64 \
+            --hidden-dim 128 \
+            --num-layers 4 \
+            --dropout 0.2 \
+            --lr 1e-3 \
+            --patience 10 \
+            --pos-weight 0 \
+            --outdir outputs/run_gcn
+
+      # ── Train GINE ─────────────────────────────────────────────────────────
+      - name: Train GINE
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python -m src.train \
+            --model gine \
+            --epochs ${{ steps.params.outputs.epochs }} \
+            --batch-size 64 \
+            --hidden-dim 128 \
+            --num-layers 4 \
+            --dropout 0.2 \
+            --lr 1e-3 \
+            --patience 10 \
+            --pos-weight 0 \
+            --outdir outputs/run_gine
+
+      # ── Dataset stats (shared across all runs) ─────────────────────────────
+      - name: Save dataset stats
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           python -c "
           from src.data.load_ogb import build_dataloaders, save_dataset_stats
           dataset, split_idx, *_ = build_dataloaders()
-          save_dataset_stats(dataset, split_idx, 'outputs/run_${{ steps.params.outputs.model }}')
+          for d in ['outputs/run_gin', 'outputs/run_gcn', 'outputs/run_gine']:
+              save_dataset_stats(dataset, split_idx, d)
           print('Dataset stats saved')
           "
-          python -m src.run_pipeline \
-            --outdir outputs/run_${{ steps.params.outputs.model }}
+          python -m src.run_pipeline --outdir outputs/run_gin
 
+      # ── Compute ensemble ROC-AUC ───────────────────────────────────────────
+      - name: Evaluate ensemble
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python -c "
+          import torch, numpy as np, json
+          from ogb.graphproppred import PygGraphPropPredDataset
+          from torch_geometric.loader import DataLoader
+          from sklearn.metrics import roc_auc_score
+          from src.models.ensemble import load_ensemble
+
+          dataset = PygGraphPropPredDataset(name='ogbg-molhiv')
+          split_idx = dataset.get_idx_split()
+          test_loader = DataLoader(dataset[split_idx['test']], batch_size=256, shuffle=False)
+
+          device = torch.device('cpu')
+          ensemble = load_ensemble({
+              'gin':  'outputs/run_gin/best_model.pt',
+              'gcn':  'outputs/run_gcn/best_model.pt',
+              'gine': 'outputs/run_gine/best_model.pt',
+          }, device)
+
+          y_true, y_score = [], []
+          for batch in test_loader:
+              y = batch.y.view(-1).float()
+              mask = ~torch.isnan(y)
+              if mask.sum() == 0: continue
+              prob = ensemble(batch.x, batch.edge_index, batch.batch, edge_attr=batch.edge_attr)
+              y_true.append(y[mask].numpy())
+              y_score.append(prob[mask].numpy())
+
+          yt = np.concatenate(y_true)
+          ys = np.concatenate(y_score)
+          auc = roc_auc_score(yt, ys)
+          print(f'Ensemble Test ROC-AUC: {auc:.4f}')
+
+          result = {'ensemble_test_roc_auc': auc, 'members': ['gin', 'gcn', 'gine']}
+          with open('outputs/ensemble_summary.json', 'w') as f:
+              json.dump(result, f, indent=2)
+          "
+          echo "=== Ensemble Summary ==="
+          cat outputs/ensemble_summary.json
+
+      # ── Show individual results ─────────────────────────────────────────────
       - name: Show results
         run: |
-          echo "=== Run Summary ==="
-          cat outputs/run_${{ steps.params.outputs.model }}/run_summary.json
-          echo ""
-          echo "=== Last 5 epochs ==="
-          python -c "
-          import pandas as pd
-          df = pd.read_csv('outputs/run_${{ steps.params.outputs.model }}/metrics.csv')
-          print(df.tail(5).to_string(index=False))
-          "
+          for model in gin gcn gine; do
+            echo "=== $model ==="
+            cat outputs/run_${model}/run_summary.json
+          done
 
+      # ── Upload artifacts ───────────────────────────────────────────────────
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: gnn-model-${{ steps.params.outputs.model }}
-          path: outputs/run_${{ steps.params.outputs.model }}/
+          name: gnn-ensemble-models
+          path: |
+            outputs/run_gin/
+            outputs/run_gcn/
+            outputs/run_gine/
+            outputs/ensemble_summary.json
           retention-days: 90
 
+      # ── Publish to GitHub Release ──────────────────────────────────────────
       - name: Publish to GitHub Release
         run: |
-          MODEL=${{ steps.params.outputs.model }}
-          OUTDIR="outputs/run_${MODEL}"
           TAG="model-latest"
-
-          # Delete old release + tag if exists
           gh release delete $TAG --yes 2>/dev/null || true
           git push origin --delete $TAG 2>/dev/null || true
 
-          # Create new release with all artifacts
           gh release create $TAG \
-            --title "Latest Trained Model ($(date -u +%Y-%m-%d))" \
-            --notes "Model: ${MODEL} | Epochs: ${{ steps.params.outputs.epochs }} | SHA: ${{ github.sha }}" \
-            ${OUTDIR}/best_model.pt \
-            ${OUTDIR}/metrics.csv \
-            ${OUTDIR}/run_summary.json \
-            ${OUTDIR}/dataset_stats.json \
-            ${OUTDIR}/preprocessing_summary.json
+            --title "Latest Ensemble Model ($(date -u +%Y-%m-%d))" \
+            --notes "Ensemble: GIN + GCN + GINE | Epochs: ${{ steps.params.outputs.epochs }} | SHA: ${{ github.sha }}" \
+            outputs/run_gin/best_model.pt#gin_best_model.pt \
+            outputs/run_gcn/best_model.pt#gcn_best_model.pt \
+            outputs/run_gine/best_model.pt#gine_best_model.pt \
+            outputs/run_gin/metrics.csv#gin_metrics.csv \
+            outputs/run_gcn/metrics.csv#gcn_metrics.csv \
+            outputs/run_gine/metrics.csv#gine_metrics.csv \
+            outputs/run_gin/run_summary.json#gin_run_summary.json \
+            outputs/run_gcn/run_summary.json#gcn_run_summary.json \
+            outputs/run_gine/run_summary.json#gine_run_summary.json \
+            outputs/run_gin/dataset_stats.json \
+            outputs/run_gin/preprocessing_summary.json \
+            outputs/ensemble_summary.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
