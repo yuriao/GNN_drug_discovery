@@ -44,11 +44,27 @@ jobs:
         id: params
         run: echo "epochs=${{ github.event.inputs.epochs || '50' }}" >> $GITHUB_OUTPUT
 
-      # ── Train GIN (augment positives + more epochs) ────────────────────────
-      - name: Train GIN
+      # ── Train GIN with 5-Fold Cross-Validation ──────────────────────────────
+      # K-Fold trains K GIN models on complementary data splits → averaged predictions
+      # reduce variance and consistently improve AUC vs single-model training.
+      - name: Train GIN (5-Fold CV)
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
+          pip install scikit-learn
+          python -m src.train_kfold \
+            --model gin \
+            --k-folds 5 \
+            --epochs ${{ steps.params.outputs.epochs }} \
+            --batch-size 64 \
+            --hidden-dim 128 \
+            --num-layers 4 \
+            --dropout 0.2 \
+            --lr 1e-3 \
+            --patience 10 \
+            --pos-weight 0 \
+            --outdir outputs/run_gin_kfold
+          # Single GIN for backward compatibility
           python -m src.train \
             --model gin \
             --epochs ${{ steps.params.outputs.epochs }} \
@@ -57,7 +73,7 @@ jobs:
             --num-layers 4 \
             --dropout 0.2 \
             --lr 1e-3 \
-            --patience 12 \
+            --patience 10 \
             --pos-weight 0 \
             --augment-positives 10 \
             --outdir outputs/run_gin
@@ -133,6 +149,7 @@ jobs:
         run: |
           python -m src.evaluate_ensemble \
             --gnn-dirs outputs/run_gin outputs/run_gcn outputs/run_gine \
+            --kfold-dir outputs/run_gin_kfold \
             --rf-path outputs/run_rf/best_model.joblib \
             --outfile outputs/ensemble_summary.json
           echo "=== Ensemble Summary ==="
@@ -153,6 +170,7 @@ jobs:
           name: gnn-ensemble-models
           path: |
             outputs/run_gin/
+            outputs/run_gin_kfold/
             outputs/run_gcn/
             outputs/run_gine/
             outputs/run_rf/
@@ -178,6 +196,13 @@ jobs:
           cp outputs/run_gcn/run_summary.json   dist/gcn_run_summary.json
           cp outputs/run_gine/run_summary.json  dist/gine_run_summary.json
           cp outputs/run_rf/run_summary.json    dist/rf_run_summary.json
+          if [ -d outputs/run_gin_kfold ]; then
+            cp outputs/run_gin_kfold/kfold_summary.json dist/kfold_summary.json 2>/dev/null || true
+            for i in 1 2 3 4 5; do
+              f=outputs/run_gin_kfold/fold_${i}/best_model.pt
+              [ -f "$f" ] && cp "$f" dist/gin_kfold_fold${i}.pt || true
+            done
+          fi
           cp outputs/run_gin/dataset_stats.json         dist/dataset_stats.json
           cp outputs/run_gin/preprocessing_summary.json dist/preprocessing_summary.json
           cp outputs/ensemble_summary.json              dist/ensemble_summary.json
@@ -196,6 +221,8 @@ jobs:
             dist/gine_run_summary.json \
             dist/rf_best_model.joblib \
             dist/rf_run_summary.json \
+            $(ls dist/gin_kfold_fold*.pt 2>/dev/null | tr '\n' ' ') \
+            $(ls dist/kfold_summary.json 2>/dev/null || true) \
             dist/dataset_stats.json \
             dist/preprocessing_summary.json \
             dist/ensemble_summary.json
