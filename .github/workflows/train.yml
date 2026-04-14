@@ -1,4 +1,4 @@
-name: Train GNN Ensemble (GIN + GCN + GINE)
+name: Train GNN Ensemble (5-Fold GIN + Morgan RF)
 
 on:
   push:
@@ -11,9 +11,13 @@ on:
   workflow_dispatch:
     inputs:
       epochs:
-        description: 'Epochs per model'
+        description: 'Epochs per fold'
         required: false
-        default: '50'
+        default: '30'
+      k_folds:
+        description: 'Number of CV folds'
+        required: false
+        default: '5'
 
 permissions:
   contents: write
@@ -21,7 +25,7 @@ permissions:
 jobs:
   train:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 240
 
     steps:
       - uses: actions/checkout@v4
@@ -38,23 +42,25 @@ jobs:
       - name: Install remaining dependencies
         run: |
           pip install torch-geometric==2.5.3
-          pip install "numpy<2" ogb rdkit scikit-learn pandas pyyaml tqdm
+          pip install "numpy<2" ogb rdkit scikit-learn joblib pandas pyyaml tqdm
 
-      - name: Set epochs
+      - name: Set params
         id: params
-        run: echo "epochs=${{ github.event.inputs.epochs || '50' }}" >> $GITHUB_OUTPUT
+        run: |
+          echo "epochs=${{ github.event.inputs.epochs || '30' }}" >> $GITHUB_OUTPUT
+          echo "k_folds=${{ github.event.inputs.k_folds || '5' }}" >> $GITHUB_OUTPUT
 
-      # ── Train GIN with 5-Fold Cross-Validation ──────────────────────────────
-      # K-Fold trains K GIN models on complementary data splits → averaged predictions
-      # reduce variance and consistently improve AUC vs single-model training.
-      - name: Train GIN (5-Fold CV)
+      # ── Train GIN with K-Fold Cross-Validation ────────────────────────────
+      # Trains K independent GIN models on complementary splits of train+val.
+      # At inference, all K models' predictions are averaged.
+      # K-Fold uses more data than single-model training and reduces variance.
+      - name: Train GIN (K-Fold CV)
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          pip install scikit-learn
           python -m src.train_kfold \
             --model gin \
-            --k-folds 5 \
+            --k-folds ${{ steps.params.outputs.k_folds }} \
             --epochs ${{ steps.params.outputs.epochs }} \
             --batch-size 64 \
             --hidden-dim 128 \
@@ -64,120 +70,67 @@ jobs:
             --patience 10 \
             --pos-weight 0 \
             --outdir outputs/run_gin_kfold
-          # Single GIN for backward compatibility
-          python -m src.train \
-            --model gin \
-            --epochs ${{ steps.params.outputs.epochs }} \
-            --batch-size 64 \
-            --hidden-dim 128 \
-            --num-layers 4 \
-            --dropout 0.2 \
-            --lr 1e-3 \
-            --patience 10 \
-            --pos-weight 0 \
-            --augment-positives 10 \
-            --outdir outputs/run_gin
 
-      # ── Train GCN ─────────────────────────────────────────────────────────
-      # Reverted to lr=1e-3 hidden=128 (lower lr caused epoch-1 convergence failure).
-      # Patience=15 gives more time; augment-positives helps the imbalanced data.
-      - name: Train GCN
-        env:
-          PYTHONPATH: ${{ github.workspace }}
-        run: |
-          python -m src.train \
-            --model gcn \
-            --epochs ${{ steps.params.outputs.epochs }} \
-            --batch-size 64 \
-            --hidden-dim 128 \
-            --num-layers 4 \
-            --dropout 0.2 \
-            --lr 1e-3 \
-            --weight-decay 1e-5 \
-            --patience 15 \
-            --pos-weight 0 \
-            --augment-positives 5 \
-            --outdir outputs/run_gcn
-
-      # ── Train GINE (edge features + augment positives) ─────────────────────
-      - name: Train GINE
-        env:
-          PYTHONPATH: ${{ github.workspace }}
-        run: |
-          python -m src.train \
-            --model gine \
-            --epochs ${{ steps.params.outputs.epochs }} \
-            --batch-size 64 \
-            --hidden-dim 128 \
-            --num-layers 4 \
-            --dropout 0.2 \
-            --lr 1e-3 \
-            --patience 12 \
-            --pos-weight 0 \
-            --augment-positives 5 \
-            --outdir outputs/run_gine
-
-      # ── Train Morgan FP + Random Forest (4th ensemble member) ─────────────
+      # ── Train Morgan FP + Random Forest ──────────────────────────────────
+      # Completely different feature space from GNN → complementary errors.
+      # Morgan fingerprints capture global circular substructures;
+      # GNN captures local graph topology. Together they see the molecule differently.
       - name: Train Morgan RF
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          pip install scikit-learn joblib
           python -m src.train_rf \
             --n-estimators 500 \
             --seed 42 \
             --outdir outputs/run_rf
 
-      # ── Dataset stats ──────────────────────────────────────────────────────
+      # ── Dataset stats ─────────────────────────────────────────────────────
       - name: Save dataset stats
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
+          mkdir -p outputs/run_gin
           python -c "
           from src.data.load_ogb import build_dataloaders, save_dataset_stats
           dataset, split_idx, *_ = build_dataloaders()
-          for d in ['outputs/run_gin', 'outputs/run_gcn', 'outputs/run_gine']:
-              save_dataset_stats(dataset, split_idx, d)
+          save_dataset_stats(dataset, split_idx, 'outputs/run_gin')
           print('Dataset stats saved')
           "
           python -m src.run_pipeline --outdir outputs/run_gin
 
-      # ── Evaluate full ensemble: GIN+GCN+GINE+RF ─────────────────────────────
+      # ── Evaluate full ensemble ────────────────────────────────────────────
       - name: Evaluate ensemble
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           python -m src.evaluate_ensemble \
-            --gnn-dirs outputs/run_gin outputs/run_gcn outputs/run_gine \
             --kfold-dir outputs/run_gin_kfold \
             --rf-path outputs/run_rf/best_model.joblib \
             --outfile outputs/ensemble_summary.json
           echo "=== Ensemble Summary ==="
           cat outputs/ensemble_summary.json
 
-      # ── Show individual results ────────────────────────────────────────────
+      # ── Show results ──────────────────────────────────────────────────────
       - name: Show results
         run: |
-          for model in gin gcn gine rf; do
-            echo "=== $model ==="
-            cat outputs/run_${model}/run_summary.json 2>/dev/null || echo "(not found)"
-          done
+          echo "=== K-Fold GIN Summary ==="
+          cat outputs/run_gin_kfold/kfold_summary.json 2>/dev/null || echo "(not found)"
+          echo "=== Morgan RF Summary ==="
+          cat outputs/run_rf/run_summary.json 2>/dev/null || echo "(not found)"
 
-      # ── Upload artifacts ───────────────────────────────────────────────────
+      # ── Upload artifacts ──────────────────────────────────────────────────
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: gnn-ensemble-models
+          name: gnn-kfold-models
           path: |
-            outputs/run_gin/
             outputs/run_gin_kfold/
-            outputs/run_gcn/
-            outputs/run_gine/
+            outputs/run_gin/
             outputs/run_rf/
             outputs/ensemble_summary.json
           retention-days: 90
 
-      # ── Publish to GitHub Release ──────────────────────────────────────────
+      # ── Publish to GitHub Release ─────────────────────────────────────────
       - name: Publish to GitHub Release
         run: |
           TAG="model-latest"
@@ -185,46 +138,34 @@ jobs:
           git push origin --delete $TAG 2>/dev/null || true
 
           mkdir -p dist
-          cp outputs/run_gin/best_model.pt       dist/gin_best_model.pt
-          cp outputs/run_gcn/best_model.pt       dist/gcn_best_model.pt
-          cp outputs/run_gine/best_model.pt      dist/gine_best_model.pt
-          cp outputs/run_rf/best_model.joblib    dist/rf_best_model.joblib
-          cp outputs/run_gin/metrics.csv    dist/gin_metrics.csv
-          cp outputs/run_gcn/metrics.csv    dist/gcn_metrics.csv
-          cp outputs/run_gine/metrics.csv   dist/gine_metrics.csv
-          cp outputs/run_gin/run_summary.json   dist/gin_run_summary.json
-          cp outputs/run_gcn/run_summary.json   dist/gcn_run_summary.json
-          cp outputs/run_gine/run_summary.json  dist/gine_run_summary.json
-          cp outputs/run_rf/run_summary.json    dist/rf_run_summary.json
-          if [ -d outputs/run_gin_kfold ]; then
-            cp outputs/run_gin_kfold/kfold_summary.json dist/kfold_summary.json 2>/dev/null || true
-            for i in 1 2 3 4 5; do
-              f=outputs/run_gin_kfold/fold_${i}/best_model.pt
-              [ -f "$f" ] && cp "$f" dist/gin_kfold_fold${i}.pt || true
-            done
-          fi
+
+          # K-Fold GIN checkpoints
+          cp outputs/run_gin_kfold/kfold_summary.json dist/kfold_summary.json 2>/dev/null || true
+          for i in 1 2 3 4 5; do
+            f="outputs/run_gin_kfold/fold_${i}/best_model.pt"
+            [ -f "$f" ] && cp "$f" "dist/gin_kfold_fold${i}.pt" || true
+          done
+
+          # RF checkpoint
+          cp outputs/run_rf/best_model.joblib  dist/rf_best_model.joblib 2>/dev/null || true
+          cp outputs/run_rf/run_summary.json   dist/rf_run_summary.json  2>/dev/null || true
+
+          # Shared artifacts
           cp outputs/run_gin/dataset_stats.json         dist/dataset_stats.json
           cp outputs/run_gin/preprocessing_summary.json dist/preprocessing_summary.json
           cp outputs/ensemble_summary.json              dist/ensemble_summary.json
 
+          # Build asset list dynamically
+          ASSETS=""
+          for f in dist/gin_kfold_fold*.pt dist/rf_best_model.joblib dist/rf_run_summary.json \
+                    dist/kfold_summary.json dist/dataset_stats.json \
+                    dist/preprocessing_summary.json dist/ensemble_summary.json; do
+            [ -f "$f" ] && ASSETS="$ASSETS $f"
+          done
+
           gh release create $TAG \
-            --title "Latest Ensemble Model ($(date -u +%Y-%m-%d))" \
-            --notes "Full ensemble: GIN+GCN+GINE+MorganRF | val-AUC softmax weights | Epochs: ${{ steps.params.outputs.epochs }} | SHA: ${{ github.sha }}" \
-            dist/gin_best_model.pt \
-            dist/gcn_best_model.pt \
-            dist/gine_best_model.pt \
-            dist/gin_metrics.csv \
-            dist/gcn_metrics.csv \
-            dist/gine_metrics.csv \
-            dist/gin_run_summary.json \
-            dist/gcn_run_summary.json \
-            dist/gine_run_summary.json \
-            dist/rf_best_model.joblib \
-            dist/rf_run_summary.json \
-            $(ls dist/gin_kfold_fold*.pt 2>/dev/null | tr '\n' ' ') \
-            $(ls dist/kfold_summary.json 2>/dev/null || true) \
-            dist/dataset_stats.json \
-            dist/preprocessing_summary.json \
-            dist/ensemble_summary.json
+            --title "Latest Model: 5-Fold GIN + Morgan RF ($(date -u +%Y-%m-%d))" \
+            --notes "Strategy: 5-Fold CV GIN + Morgan FP+RF | Epochs: ${{ steps.params.outputs.epochs }} | K: ${{ steps.params.outputs.k_folds }} | SHA: ${{ github.sha }}" \
+            $ASSETS
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
