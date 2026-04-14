@@ -13,7 +13,7 @@ on:
       epochs:
         description: 'Epochs per model'
         required: false
-        default: '30'
+        default: '50'
 
 permissions:
   contents: write
@@ -21,7 +21,7 @@ permissions:
 jobs:
   train:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
 
     steps:
       - uses: actions/checkout@v4
@@ -42,9 +42,9 @@ jobs:
 
       - name: Set epochs
         id: params
-        run: echo "epochs=${{ github.event.inputs.epochs || '30' }}" >> $GITHUB_OUTPUT
+        run: echo "epochs=${{ github.event.inputs.epochs || '50' }}" >> $GITHUB_OUTPUT
 
-      # ── Train GIN ──────────────────────────────────────────────────────────
+      # ── Train GIN (augment positives + more epochs) ────────────────────────
       - name: Train GIN
         env:
           PYTHONPATH: ${{ github.workspace }}
@@ -57,12 +57,14 @@ jobs:
             --num-layers 4 \
             --dropout 0.2 \
             --lr 1e-3 \
-            --patience 10 \
+            --patience 12 \
             --pos-weight 0 \
             --augment-positives 10 \
             --outdir outputs/run_gin
 
-      # ── Train GCN ──────────────────────────────────────────────────────────
+      # ── Train GCN (larger hidden, lower LR, more patience) ────────────────
+      # GCN needs more epochs to converge — it uses mean aggregation which
+      # requires more gradient steps to learn the right representations.
       - name: Train GCN
         env:
           PYTHONPATH: ${{ github.workspace }}
@@ -71,15 +73,16 @@ jobs:
             --model gcn \
             --epochs ${{ steps.params.outputs.epochs }} \
             --batch-size 64 \
-            --hidden-dim 128 \
-            --num-layers 4 \
-            --dropout 0.2 \
-            --lr 1e-3 \
-            --patience 10 \
+            --hidden-dim 256 \
+            --num-layers 5 \
+            --dropout 0.3 \
+            --lr 5e-4 \
+            --weight-decay 1e-5 \
+            --patience 15 \
             --pos-weight 0 \
             --outdir outputs/run_gcn
 
-      # ── Train GINE ─────────────────────────────────────────────────────────
+      # ── Train GINE (edge features + augment positives) ─────────────────────
       - name: Train GINE
         env:
           PYTHONPATH: ${{ github.workspace }}
@@ -92,11 +95,12 @@ jobs:
             --num-layers 4 \
             --dropout 0.2 \
             --lr 1e-3 \
-            --patience 10 \
+            --patience 12 \
             --pos-weight 0 \
+            --augment-positives 5 \
             --outdir outputs/run_gine
 
-      # ── Dataset stats (shared across all runs) ─────────────────────────────
+      # ── Dataset stats ──────────────────────────────────────────────────────
       - name: Save dataset stats
         env:
           PYTHONPATH: ${{ github.workspace }}
@@ -110,7 +114,7 @@ jobs:
           "
           python -m src.run_pipeline --outdir outputs/run_gin
 
-      # ── Compute ensemble ROC-AUC ───────────────────────────────────────────
+      # ── Evaluate ensemble with val-AUC weighting ───────────────────────────
       - name: Evaluate ensemble
         env:
           PYTHONPATH: ${{ github.workspace }}
@@ -120,17 +124,19 @@ jobs:
           from ogb.graphproppred import PygGraphPropPredDataset
           from torch_geometric.loader import DataLoader
           from sklearn.metrics import roc_auc_score
-          from src.models.ensemble import load_ensemble
+          from src.models.ensemble import load_ensemble_from_dirs
 
           dataset = PygGraphPropPredDataset(name='ogbg-molhiv')
           split_idx = dataset.get_idx_split()
           test_loader = DataLoader(dataset[split_idx['test']], batch_size=256, shuffle=False)
 
           device = torch.device('cpu')
-          ensemble = load_ensemble({
-              'gin':  'outputs/run_gin/best_model.pt',
-              'gcn':  'outputs/run_gcn/best_model.pt',
-              'gine': 'outputs/run_gine/best_model.pt',
+          # load_ensemble_from_dirs reads val_auc from run_summary.json
+          # and applies softmax weighting — down-weights poor members automatically
+          ensemble = load_ensemble_from_dirs({
+              'gin':  'outputs/run_gin',
+              'gcn':  'outputs/run_gcn',
+              'gine': 'outputs/run_gine',
           }, device)
 
           y_true, y_score = [], []
@@ -145,16 +151,30 @@ jobs:
           yt = np.concatenate(y_true)
           ys = np.concatenate(y_score)
           auc = roc_auc_score(yt, ys)
-          print(f'Ensemble Test ROC-AUC: {auc:.4f}')
+          print(f'Weighted Ensemble Test ROC-AUC: {auc:.4f}')
 
-          result = {'ensemble_test_roc_auc': auc, 'members': ['gin', 'gcn', 'gine']}
+          # Read individual summaries
+          members = {}
+          for m in ['gin', 'gcn', 'gine']:
+              sf = f'outputs/run_{m}/run_summary.json'
+              try:
+                  members[m] = json.load(open(sf))
+              except Exception:
+                  pass
+
+          result = {
+              'ensemble_test_roc_auc': auc,
+              'weighting': 'val_auc_softmax',
+              'temperature': 0.05,
+              'members': members,
+          }
           with open('outputs/ensemble_summary.json', 'w') as f:
               json.dump(result, f, indent=2)
           "
           echo "=== Ensemble Summary ==="
           cat outputs/ensemble_summary.json
 
-      # ── Show individual results ─────────────────────────────────────────────
+      # ── Show individual results ────────────────────────────────────────────
       - name: Show results
         run: |
           for model in gin gcn gine; do
@@ -181,7 +201,6 @@ jobs:
           gh release delete $TAG --yes 2>/dev/null || true
           git push origin --delete $TAG 2>/dev/null || true
 
-          # gh release create requires unique filenames — copy to dist/ with unique names
           mkdir -p dist
           cp outputs/run_gin/best_model.pt  dist/gin_best_model.pt
           cp outputs/run_gcn/best_model.pt  dist/gcn_best_model.pt
@@ -198,7 +217,7 @@ jobs:
 
           gh release create $TAG \
             --title "Latest Ensemble Model ($(date -u +%Y-%m-%d))" \
-            --notes "Ensemble: GIN + GCN + GINE | Epochs: ${{ steps.params.outputs.epochs }} | SHA: ${{ github.sha }}" \
+            --notes "Weighted ensemble: GIN+GCN+GINE | val-AUC softmax weights | Epochs: ${{ steps.params.outputs.epochs }} | SHA: ${{ github.sha }}" \
             dist/gin_best_model.pt \
             dist/gcn_best_model.pt \
             dist/gine_best_model.pt \
