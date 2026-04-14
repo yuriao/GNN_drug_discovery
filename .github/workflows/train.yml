@@ -101,6 +101,17 @@ jobs:
             --augment-positives 5 \
             --outdir outputs/run_gine
 
+      # ── Train Morgan FP + Random Forest (4th ensemble member) ─────────────
+      - name: Train Morgan RF
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          pip install scikit-learn joblib
+          python -m src.train_rf \
+            --n-estimators 500 \
+            --seed 42 \
+            --outdir outputs/run_rf
+
       # ── Dataset stats ──────────────────────────────────────────────────────
       - name: Save dataset stats
         env:
@@ -115,72 +126,24 @@ jobs:
           "
           python -m src.run_pipeline --outdir outputs/run_gin
 
-      # ── Evaluate ensemble with val-AUC weighting ───────────────────────────
+      # ── Evaluate full ensemble: GIN+GCN+GINE+RF ─────────────────────────────
       - name: Evaluate ensemble
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          python -c "
-          import torch, numpy as np, json
-          from ogb.graphproppred import PygGraphPropPredDataset
-          from torch_geometric.loader import DataLoader
-          from sklearn.metrics import roc_auc_score
-          from src.models.ensemble import load_ensemble_from_dirs
-
-          dataset = PygGraphPropPredDataset(name='ogbg-molhiv')
-          split_idx = dataset.get_idx_split()
-          test_loader = DataLoader(dataset[split_idx['test']], batch_size=256, shuffle=False)
-
-          device = torch.device('cpu')
-          # load_ensemble_from_dirs reads val_auc from run_summary.json
-          # and applies softmax weighting — down-weights poor members automatically
-          ensemble = load_ensemble_from_dirs({
-              'gin':  'outputs/run_gin',
-              'gcn':  'outputs/run_gcn',
-              'gine': 'outputs/run_gine',
-          }, device)
-
-          y_true, y_score = [], []
-          for batch in test_loader:
-              y = batch.y.view(-1).float()
-              mask = ~torch.isnan(y)
-              if mask.sum() == 0: continue
-              prob = ensemble(batch.x, batch.edge_index, batch.batch, edge_attr=batch.edge_attr)
-              y_true.append(y[mask].numpy())
-              y_score.append(prob[mask].numpy())
-
-          yt = np.concatenate(y_true)
-          ys = np.concatenate(y_score)
-          auc = roc_auc_score(yt, ys)
-          print(f'Weighted Ensemble Test ROC-AUC: {auc:.4f}')
-
-          # Read individual summaries
-          members = {}
-          for m in ['gin', 'gcn', 'gine']:
-              sf = f'outputs/run_{m}/run_summary.json'
-              try:
-                  members[m] = json.load(open(sf))
-              except Exception:
-                  pass
-
-          result = {
-              'ensemble_test_roc_auc': auc,
-              'weighting': 'val_auc_softmax',
-              'temperature': 0.05,
-              'members': members,
-          }
-          with open('outputs/ensemble_summary.json', 'w') as f:
-              json.dump(result, f, indent=2)
-          "
+          python -m src.evaluate_ensemble \
+            --gnn-dirs outputs/run_gin outputs/run_gcn outputs/run_gine \
+            --rf-path outputs/run_rf/best_model.joblib \
+            --outfile outputs/ensemble_summary.json
           echo "=== Ensemble Summary ==="
           cat outputs/ensemble_summary.json
 
       # ── Show individual results ────────────────────────────────────────────
       - name: Show results
         run: |
-          for model in gin gcn gine; do
+          for model in gin gcn gine rf; do
             echo "=== $model ==="
-            cat outputs/run_${model}/run_summary.json
+            cat outputs/run_${model}/run_summary.json 2>/dev/null || echo "(not found)"
           done
 
       # ── Upload artifacts ───────────────────────────────────────────────────
@@ -192,6 +155,7 @@ jobs:
             outputs/run_gin/
             outputs/run_gcn/
             outputs/run_gine/
+            outputs/run_rf/
             outputs/ensemble_summary.json
           retention-days: 90
 
@@ -203,22 +167,24 @@ jobs:
           git push origin --delete $TAG 2>/dev/null || true
 
           mkdir -p dist
-          cp outputs/run_gin/best_model.pt  dist/gin_best_model.pt
-          cp outputs/run_gcn/best_model.pt  dist/gcn_best_model.pt
-          cp outputs/run_gine/best_model.pt dist/gine_best_model.pt
+          cp outputs/run_gin/best_model.pt       dist/gin_best_model.pt
+          cp outputs/run_gcn/best_model.pt       dist/gcn_best_model.pt
+          cp outputs/run_gine/best_model.pt      dist/gine_best_model.pt
+          cp outputs/run_rf/best_model.joblib    dist/rf_best_model.joblib
           cp outputs/run_gin/metrics.csv    dist/gin_metrics.csv
           cp outputs/run_gcn/metrics.csv    dist/gcn_metrics.csv
           cp outputs/run_gine/metrics.csv   dist/gine_metrics.csv
           cp outputs/run_gin/run_summary.json   dist/gin_run_summary.json
           cp outputs/run_gcn/run_summary.json   dist/gcn_run_summary.json
           cp outputs/run_gine/run_summary.json  dist/gine_run_summary.json
+          cp outputs/run_rf/run_summary.json    dist/rf_run_summary.json
           cp outputs/run_gin/dataset_stats.json         dist/dataset_stats.json
           cp outputs/run_gin/preprocessing_summary.json dist/preprocessing_summary.json
           cp outputs/ensemble_summary.json              dist/ensemble_summary.json
 
           gh release create $TAG \
             --title "Latest Ensemble Model ($(date -u +%Y-%m-%d))" \
-            --notes "Weighted ensemble: GIN+GCN+GINE | val-AUC softmax weights | Epochs: ${{ steps.params.outputs.epochs }} | SHA: ${{ github.sha }}" \
+            --notes "Full ensemble: GIN+GCN+GINE+MorganRF | val-AUC softmax weights | Epochs: ${{ steps.params.outputs.epochs }} | SHA: ${{ github.sha }}" \
             dist/gin_best_model.pt \
             dist/gcn_best_model.pt \
             dist/gine_best_model.pt \
@@ -228,6 +194,8 @@ jobs:
             dist/gin_run_summary.json \
             dist/gcn_run_summary.json \
             dist/gine_run_summary.json \
+            dist/rf_best_model.joblib \
+            dist/rf_run_summary.json \
             dist/dataset_stats.json \
             dist/preprocessing_summary.json \
             dist/ensemble_summary.json
