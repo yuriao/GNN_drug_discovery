@@ -62,9 +62,9 @@ jobs:
             --augment-positives 10 \
             --outdir outputs/run_gin
 
-      # ── Train GCN (larger hidden, lower LR, more patience) ────────────────
-      # GCN needs more epochs to converge — it uses mean aggregation which
-      # requires more gradient steps to learn the right representations.
+      # ── Train GCN ─────────────────────────────────────────────────────────
+      # Reverted to lr=1e-3 hidden=128 (lower lr caused epoch-1 convergence failure).
+      # Patience=15 gives more time; augment-positives helps the imbalanced data.
       - name: Train GCN
         env:
           PYTHONPATH: ${{ github.workspace }}
@@ -73,13 +73,14 @@ jobs:
             --model gcn \
             --epochs ${{ steps.params.outputs.epochs }} \
             --batch-size 64 \
-            --hidden-dim 256 \
-            --num-layers 5 \
-            --dropout 0.3 \
-            --lr 5e-4 \
+            --hidden-dim 128 \
+            --num-layers 4 \
+            --dropout 0.2 \
+            --lr 1e-3 \
             --weight-decay 1e-5 \
             --patience 15 \
             --pos-weight 0 \
+            --augment-positives 5 \
             --outdir outputs/run_gcn
 
       # ── Train GINE (edge features + augment positives) ─────────────────────
