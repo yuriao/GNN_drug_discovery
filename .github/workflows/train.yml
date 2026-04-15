@@ -59,7 +59,7 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           python -m src.train_kfold \
-            --model gin \
+            --model gin_enhanced \
             --k-folds ${{ steps.params.outputs.k_folds }} \
             --epochs ${{ steps.params.outputs.epochs }} \
             --batch-size 64 \
@@ -165,7 +165,7 @@ jobs:
 
           gh release create $TAG \
             --title "Latest Model: 5-Fold GIN + Morgan RF ($(date -u +%Y-%m-%d))" \
-            --notes "Strategy: 5-Fold CV GIN + Morgan FP+RF | Epochs: ${{ steps.params.outputs.epochs }} | K: ${{ steps.params.outputs.k_folds }} | SHA: ${{ github.sha }}" \
+            --notes "Strategy: 5-Fold Enhanced GIN (VNode+JK+RDKit) + Morgan RF | Epochs: ${{ steps.params.outputs.epochs }} | K: ${{ steps.params.outputs.k_folds }} | SHA: ${{ github.sha }}" \
             $ASSETS
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
