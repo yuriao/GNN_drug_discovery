@@ -134,7 +134,9 @@ def main():
             f = smiles_to_global_features(smi)
             all_feats.append(f if f is not None else _np.zeros(NUM_GLOBAL_FEATURES, dtype=_np.float32))
         all_feats = _np.stack(all_feats)
-        print(f"Global features computed. Shape: {all_feats.shape}")
+        all_feats = _np.nan_to_num(all_feats, nan=0.0, posinf=5.0, neginf=-5.0)
+        n_bad = int(_np.isnan(all_feats).sum())
+        print(f"Global features computed. Shape: {all_feats.shape}  NaN remaining: {n_bad}")
 
     all_labels = np.array([
         dataset[int(i)].y.view(-1)[0].item() for i in range(len(dataset))
