@@ -84,6 +84,7 @@ def smiles_to_global_features(smiles: str) -> Optional[np.ndarray]:
         # Normalise (z-score with pre-computed constants)
         feats = (feats - _NORM_MEAN) / (_NORM_STD + 1e-8)
         # Clip extreme values
+        feats = np.nan_to_num(feats, nan=0.0, posinf=5.0, neginf=-5.0)
         feats = np.clip(feats, -5.0, 5.0)
         return feats
 
